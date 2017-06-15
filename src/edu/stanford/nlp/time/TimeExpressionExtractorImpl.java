@@ -66,7 +66,13 @@ public class TimeExpressionExtractorImpl implements TimeExpressionExtractor {
       if (timeIndex == null) {
         docAnnotation.set(TimeExpression.TimeIndexAnnotation.class, timeIndex = new SUTime.TimeIndex());
       }
-      docDate = docAnnotation.get(CoreAnnotations.DocDateAnnotation.class);
+      // default look for the sentence's forum post date
+      // if it doesn't have one, back off to the document date
+      if (annotation.get(CoreAnnotations.SectionDateAnnotation.class) != null) {
+        docDate = annotation.get(CoreAnnotations.SectionDateAnnotation.class);
+      } else {
+        docDate = docAnnotation.get(CoreAnnotations.DocDateAnnotation.class);
+      }
       if (docDate == null) {
         Calendar cal = docAnnotation.get(CoreAnnotations.CalendarAnnotation.class);
         if (cal == null) {
@@ -179,8 +185,13 @@ public class TimeExpressionExtractorImpl implements TimeExpressionExtractor {
 
   public List<TimeExpression> extractTimeExpressions(CoreMap annotation, SUTime.Time refDate, SUTime.TimeIndex timeIndex) {
     if (!annotation.containsKey(CoreAnnotations.NumerizedTokensAnnotation.class)) {
-      List<CoreMap> mergedNumbers = NumberNormalizer.findAndMergeNumbers(annotation);
-      annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, mergedNumbers);
+      try {
+        List<CoreMap> mergedNumbers = NumberNormalizer.findAndMergeNumbers(annotation);
+        annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, mergedNumbers);
+      } catch (NumberFormatException e) {
+        logger.warn("Caught bad number: " + e.getMessage());
+        annotation.set(CoreAnnotations.NumerizedTokensAnnotation.class, new ArrayList<>());
+      }
     }
 
     List<? extends MatchedExpression> matchedExpressions = expressionExtractor.extractExpressions(annotation);

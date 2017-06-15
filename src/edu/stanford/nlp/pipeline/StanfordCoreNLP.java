@@ -43,6 +43,7 @@ import java.io.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -86,7 +87,44 @@ import java.util.regex.Pattern;
 
 public class StanfordCoreNLP extends AnnotationPipeline  {
 
-  enum OutputFormat { TEXT, XML, JSON, CONLL, CONLLU, SERIALIZED }
+  public enum OutputFormat { TEXT, XML, JSON, CONLL, CONLLU, SERIALIZED, CUSTOM }
+
+
+  /**
+   * An annotator name and its associated signature.
+   * Used in {@link #GLOBAL_ANNOTATOR_CACHE}.
+   */
+  public static class AnnotatorSignature {
+    public final String name;
+    public final String signature;
+
+    public AnnotatorSignature(String name, String signature) {
+      this.name = name;
+      this.signature = signature;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      AnnotatorSignature that = (AnnotatorSignature) o;
+      return Objects.equals(name, that.name) &&
+          Objects.equals(signature, that.signature);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(name, signature);
+    }
+  }
+
+
+  /**
+   * A global cache of annotators, so we don't have to re-create one if there's enough memory floating around.
+   */
+  public static final Map<AnnotatorSignature, Lazy<Annotator>> GLOBAL_ANNOTATOR_CACHE = new ConcurrentHashMap<>();
+
+
 
   // other constants
   public static final String CUSTOM_ANNOTATOR_PREFIX = "customAnnotatorClass.";
@@ -111,13 +149,12 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
   /** Stores the time (in milliseconds) required to construct the last pipeline. */
   private long pipelineSetupTime;
 
-
-  /** Maintains the shared pool of annotators. */
-  protected static AnnotatorPool pool = null;
-
   private Properties properties;
 
   private Semaphore availableProcessors;
+
+  /** The annotator pool we should be using to get annotators. */
+  public final AnnotatorPool pool;
 
 
   /**
@@ -151,7 +188,8 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
   }
 
   public StanfordCoreNLP(Properties props, boolean enforceRequirements, AnnotatorPool annotatorPool)  {
-    construct(props, enforceRequirements, getAnnotatorImplementations(), annotatorPool);
+    this.pool = annotatorPool != null ? annotatorPool : constructAnnotatorPool(props, getAnnotatorImplementations());
+    construct(props, enforceRequirements, getAnnotatorImplementations());
   }
 
   /**
@@ -167,7 +205,8 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
     if (props == null) {
       throw new RuntimeIOException("ERROR: cannot find properties file \"" + propsFileNamePrefix + "\" in the classpath!");
     }
-    construct(props, enforceRequirements, getAnnotatorImplementations(), null);
+    this.pool = constructAnnotatorPool(props, getAnnotatorImplementations());
+    construct(props, enforceRequirements, getAnnotatorImplementations());
   }
 
   //
@@ -406,7 +445,7 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
   // AnnotatorPool construction support
   //
 
-  private void construct(Properties props, boolean enforceRequirements, AnnotatorImplementations annotatorImplementations, AnnotatorPool pool) {
+  private void construct(Properties props, boolean enforceRequirements, AnnotatorImplementations annotatorImplementations) {
     Timing tim = new Timing();
     this.numWords = 0;
     this.constituentTreePrinter = new TreePrint("penn");
@@ -425,11 +464,6 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
       props = fromClassPath;
     }
     this.properties = props;
-
-    if (pool == null) {
-      // if undefined, load the default annotator pool
-      pool = getDefaultAnnotatorPool(props, annotatorImplementations);
-    }
 
     // Set threading
     if (this.properties.containsKey("threads")) {
@@ -481,41 +515,45 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
    * release the memory associated with the annotators.
    */
   public static synchronized void clearAnnotatorPool() {
-    pool = null;
+    logger.warn("Clearing CoreNLP annotation pool; this should be unnecessary in production");
+    GLOBAL_ANNOTATOR_CACHE.clear();
   }
 
 
   /**
    * This function defines the list of named annotators in CoreNLP, along with how to construct
    * them.
+   *
    * @return A map from annotator name, to the function which constructs that annotator.
    */
-  private static Map<String, BiFunction<Properties, AnnotatorImplementations, AnnotatorFactory>> getNamedAnnotators() {
-    Map<String, BiFunction<Properties, AnnotatorImplementations, AnnotatorFactory>> pool = new HashMap<>();
-    pool.put(STANFORD_TOKENIZE, AnnotatorFactories::tokenize);
-    pool.put(STANFORD_CLEAN_XML, AnnotatorFactories::cleanXML);
-    pool.put(STANFORD_SSPLIT, AnnotatorFactories::sentenceSplit);
-    pool.put(STANFORD_POS, AnnotatorFactories::posTag);
-    pool.put(STANFORD_LEMMA, AnnotatorFactories::lemma);
-    pool.put(STANFORD_NER, AnnotatorFactories::nerTag);
-    pool.put(STANFORD_REGEXNER, AnnotatorFactories::regexNER);
-    pool.put(STANFORD_ENTITY_MENTIONS, AnnotatorFactories::entityMentions);
-    pool.put(STANFORD_GENDER, AnnotatorFactories::gender);
-    pool.put(STANFORD_TRUECASE, AnnotatorFactories::truecase);
-    pool.put(STANFORD_PARSE, AnnotatorFactories::parse);
-    pool.put(STANFORD_MENTION, AnnotatorFactories::mention);
-    pool.put(STANFORD_DETERMINISTIC_COREF, AnnotatorFactories::dcoref);
-    pool.put(STANFORD_COREF, AnnotatorFactories::coref);
-    pool.put(STANFORD_RELATION, AnnotatorFactories::relation);
-    pool.put(STANFORD_SENTIMENT, AnnotatorFactories::sentiment);
-    pool.put(STANFORD_COLUMN_DATA_CLASSIFIER, AnnotatorFactories::columnDataClassifier);
-    pool.put(STANFORD_DEPENDENCIES, AnnotatorFactories::dependencies);
-    pool.put(STANFORD_NATLOG, AnnotatorFactories::natlog);
-    pool.put(STANFORD_OPENIE, AnnotatorFactories::openie);
-    pool.put(STANFORD_QUOTE, AnnotatorFactories::quote);
-    pool.put(STANFORD_UD_FEATURES, AnnotatorFactories::udfeats);
-    pool.put(STANFORD_LINK, AnnotatorFactories::link);
-    pool.put(STANFORD_KBP, AnnotatorFactories::kbp);
+  private static Map<String, BiFunction<Properties, AnnotatorImplementations, Annotator>> getNamedAnnotators() {
+    Map<String, BiFunction<Properties, AnnotatorImplementations, Annotator>> pool = new HashMap<>();
+    pool.put(STANFORD_TOKENIZE, (props, impl) -> impl.tokenizer(props));
+    pool.put(STANFORD_CLEAN_XML, (props, impl) -> impl.cleanXML(props));
+    pool.put(STANFORD_SSPLIT, (props, impl) -> impl.wordToSentences(props));
+    pool.put(STANFORD_POS, (props, impl) -> impl.posTagger(props));
+    pool.put(STANFORD_LEMMA, (props, impl) -> impl.morpha(props, false));
+    pool.put(STANFORD_NER, (props, impl) -> impl.ner(props));
+    pool.put(STANFORD_TOKENSREGEX, (props, impl) -> impl.tokensregex(props, STANFORD_TOKENSREGEX));
+    pool.put(STANFORD_REGEXNER, (props, impl) -> impl.tokensRegexNER(props, STANFORD_REGEXNER));
+    pool.put(STANFORD_ENTITY_MENTIONS, (props, impl) -> impl.entityMentions(props, STANFORD_ENTITY_MENTIONS));
+    pool.put(STANFORD_GENDER, (props, impl) -> impl.gender(props, false));
+    pool.put(STANFORD_TRUECASE, (props, impl) -> impl.trueCase(props));
+    pool.put(STANFORD_PARSE, (props, impl) -> impl.parse(props));
+    pool.put(STANFORD_MENTION, (props, impl) -> impl.mention(props));
+    pool.put(STANFORD_DETERMINISTIC_COREF, (props, impl) -> impl.dcoref(props));
+    pool.put(STANFORD_COREF, (props, impl) -> impl.coref(props));
+    pool.put(STANFORD_RELATION, (props, impl) -> impl.relations(props));
+    pool.put(STANFORD_SENTIMENT, (props, impl) -> impl.sentiment(props, STANFORD_SENTIMENT));
+    pool.put(STANFORD_COLUMN_DATA_CLASSIFIER, (props, impl) -> impl.columnData(props));
+    pool.put(STANFORD_DEPENDENCIES, (props, impl) -> impl.dependencies(props));
+    pool.put(STANFORD_NATLOG, (props, impl) -> impl.natlog(props));
+    pool.put(STANFORD_OPENIE, (props, impl) -> impl.openie(props));
+    pool.put(STANFORD_QUOTE, (props, impl) -> impl.quote(props));
+    pool.put(STANFORD_QUOTE_ATTRIBUTION, (props, impl) -> impl.quoteattribution(props));
+    pool.put(STANFORD_UD_FEATURES, (props, impl) -> impl.udfeats(props));
+    pool.put(STANFORD_LINK, (props, impl) -> impl.link(props));
+    pool.put(STANFORD_KBP, (props, impl) -> impl.kbp(props));
     return pool;
   }
 
@@ -528,11 +566,10 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
    */
   public static synchronized AnnotatorPool getDefaultAnnotatorPool(final Properties inputProps, final AnnotatorImplementations annotatorImplementation) {
     // if the pool already exists reuse!
-    if (pool == null) {
-      pool = new AnnotatorPool();
-    }
-    for (Map.Entry<String, BiFunction<Properties, AnnotatorImplementations, AnnotatorFactory>> entry : getNamedAnnotators().entrySet()) {
-      pool.register(entry.getKey(), entry.getValue().apply(inputProps, annotatorImplementation));
+    AnnotatorPool pool = AnnotatorPool.SINGLETON;
+    for (Map.Entry<String, BiFunction<Properties, AnnotatorImplementations, Annotator>> entry : getNamedAnnotators().entrySet()) {
+      AnnotatorSignature key = new AnnotatorSignature(entry.getKey(), PropertiesUtils.getSignature(entry.getKey(), inputProps));
+      pool.register(entry.getKey(), inputProps, GLOBAL_ANNOTATOR_CACHE.computeIfAbsent(key, (sig) -> Lazy.cache(() -> entry.getValue().apply(inputProps, annotatorImplementation))));
     }
     registerCustomAnnotators(pool, annotatorImplementation, inputProps);
     return pool;
@@ -555,13 +592,8 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
             property.substring(CUSTOM_ANNOTATOR_PREFIX.length());
         final String customClassName = inputProps.getProperty(property);
         logger.info("Registering annotator " + customName + " with class " + customClassName);
-        pool.register(customName, new AnnotatorFactory(customName, customClassName, inputProps) {
-          private static final long serialVersionUID = 1L;
-          @Override
-          public Annotator create() {
-            return annotatorImplementation.custom(properties, property);
-          }
-        });
+        AnnotatorSignature key = new AnnotatorSignature(customName, PropertiesUtils.getSignature(customName, inputProps));
+        pool.register(customName, inputProps, GLOBAL_ANNOTATOR_CACHE.computeIfAbsent(key, (sig) -> Lazy.cache(() -> annotatorImplementation.custom(inputProps, property))));
       }
     }
   }
@@ -577,8 +609,9 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
    */
   public static AnnotatorPool constructAnnotatorPool(final Properties inputProps, final AnnotatorImplementations annotatorImplementation) {
     AnnotatorPool pool = new AnnotatorPool();
-    for (Map.Entry<String, BiFunction<Properties, AnnotatorImplementations, AnnotatorFactory>> entry : getNamedAnnotators().entrySet()) {
-      pool.register(entry.getKey(), entry.getValue().apply(inputProps, annotatorImplementation));
+    for (Map.Entry<String, BiFunction<Properties, AnnotatorImplementations, Annotator>> entry : getNamedAnnotators().entrySet()) {
+      AnnotatorSignature key = new AnnotatorSignature(entry.getKey(), PropertiesUtils.getSignature(entry.getKey(), inputProps));
+      pool.register(entry.getKey(), inputProps, GLOBAL_ANNOTATOR_CACHE.computeIfAbsent(key, (sig) -> Lazy.cache(() -> entry.getValue().apply(inputProps, annotatorImplementation))));
     }
     registerCustomAnnotators(pool, annotatorImplementation, inputProps);
     return pool;
@@ -587,20 +620,24 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
 
 
   public static synchronized Annotator getExistingAnnotator(String name) {
-    if(pool == null){
-      logger.error("Attempted to fetch annotator \"" + name + "\" before the annotator pool was created!");
-      return null;
-    }
-    try {
-      return pool.get(name);
-    } catch(IllegalArgumentException e) {
+    Optional<Annotator> annotator = GLOBAL_ANNOTATOR_CACHE.entrySet().stream()
+        .filter(entry -> name.equals(entry.getKey().name))
+        .map(entry -> Optional.ofNullable(entry.getValue().getIfDefined()))
+        .filter(Optional::isPresent)
+        .map(Optional::get)
+        .findFirst();
+    if (annotator.isPresent()) {
+      return annotator.get();
+    } else {
       logger.error("Attempted to fetch annotator \"" + name +
-        "\" but the annotator pool does not store any such type!");
+          "\" but the annotator pool does not store any such type!");
       return null;
     }
   }
 
+
   @Override
+  /** {@inheritDoc} */
   public void annotate(Annotation annotation) {
     super.annotate(annotation);
     List<CoreLabel> words = annotation.get(CoreAnnotations.TokensAnnotation.class);
@@ -620,18 +657,15 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
       } catch (InterruptedException e) {
         throw new RuntimeInterruptedException(e);
       }
-      new Thread() {
-        @Override
-        public void run() {
-          try {
-            annotate(annotation);
-          } catch (Throwable t) {
-            annotation.set(CoreAnnotations.ExceptionAnnotation.class, t);
-          }
-          callback.accept(annotation);
-          availableProcessors.release();
+      new Thread(() -> {
+        try {
+          annotate(annotation);
+        } catch (Throwable t) {
+          annotation.set(CoreAnnotations.ExceptionAnnotation.class, t);
         }
-      }.start();
+        callback.accept(annotation);
+        availableProcessors.release();
+      }).start();
     }
   }
 
@@ -842,7 +876,8 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
     os.println("\t             output is generated for every input file as file.outputExtension");
     os.println("\t\"outputDirectory\" - where to put output (defaults to the current directory)");
     os.println("\t\"outputExtension\" - extension to use for the output file (defaults to \".xml\" for XML, \".ser.gz\" for serialized).  Don't forget the dot!");
-    os.println("\t\"outputFormat\" - \"xml\" (usual default), \"text\" (default for REPL or if no XML), \"json\", \"conll\", \"conllu\", or \"serialized\"");
+    os.println("\t\"outputFormat\" - \"xml\" (usual default), \"text\" (default for REPL or if no XML), \"json\", \"conll\", \"conllu\", \"serialized\", or \"custom\"");
+    os.println("\t\"customOutputter\" - specify a class to a custom outputter instead of a pre-defined output format");
     os.println("\t\"serializer\" - Class of annotation serializer to use when outputFormat is \"serialized\".  By default, uses Java serialization.");
     os.println("\t\"replaceExtension\" - flag to chop off the last extension before adding outputExtension to file");
     os.println("\t\"noClobber\" - don't automatically override (clobber) output files that already exist");
@@ -910,6 +945,10 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
         case TEXT:
           pipeline.prettyPrint(anno, System.out);
           break;
+        case CUSTOM:
+          AnnotationOutputter outputter = ReflectionLoading.loadByReflection(pipeline.properties.getProperty("customOutputter"));
+          outputter.print(anno, System.out, pipeline);
+          break;
         default:
           throw new IllegalArgumentException("Cannot output in format " + outputFormat + " from the interactive shell");
         }
@@ -939,25 +978,26 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
    * @param base The base input directory to process from.
    * @param files The files to process.
    * @param numThreads The number of threads to annotate on.
+   * @param clearPool Whether or not to clear pool when process is done
    *
    * @throws IOException
    */
-  public void processFiles(String base, final Collection<File> files, int numThreads) throws IOException {
+  public void processFiles(String base, final Collection<File> files, int numThreads, boolean clearPool) throws IOException {
     AnnotationOutputter.Options options = AnnotationOutputter.getOptions(this);
     StanfordCoreNLP.OutputFormat outputFormat = StanfordCoreNLP.OutputFormat.valueOf(properties.getProperty("outputFormat", DEFAULT_OUTPUT_FORMAT).toUpperCase());
-    processFiles(base, files, numThreads, properties, this::annotate, createOutputter(properties, options), outputFormat);
+    processFiles(base, files, numThreads, properties, this::annotate, createOutputter(properties, options), outputFormat, clearPool);
   }
 
 
   /**
-   * Create an outputter to be passed into {@link StanfordCoreNLP#processFiles(String, Collection, int, Properties, BiConsumer, BiConsumer, OutputFormat)}.
+   * Create an outputter to be passed into {@link StanfordCoreNLP#processFiles(String, Collection, int, Properties, BiConsumer, BiConsumer, OutputFormat, boolean)}.
    *
    * @param properties The properties file to use.
    * @param outputOptions The means of creating output options
    *
    * @return A consumer that can be passed into the processFiles method.
    */
-  protected static BiConsumer<Annotation, OutputStream> createOutputter(Properties properties, AnnotationOutputter.Options outputOptions) {
+  public static BiConsumer<Annotation, OutputStream> createOutputter(Properties properties, AnnotationOutputter.Options outputOptions) {
     final OutputFormat outputFormat =
         OutputFormat.valueOf(properties.getProperty("outputFormat", DEFAULT_OUTPUT_FORMAT).toUpperCase());
 
@@ -995,6 +1035,10 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
           case CONLLU:
             new CoNLLUOutputter().print(annotation, fos, outputOptions);
             break;
+          case CUSTOM:
+            AnnotationOutputter outputter = ReflectionLoading.loadByReflection(properties.getProperty("customOutputter"));
+            outputter.print(annotation, fos, outputOptions);
+            break;
           default:
             throw new IllegalArgumentException("Unknown output format " + outputFormat);
         }
@@ -1015,12 +1059,15 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
    *                   This should match the properties file used in the implementation of the annotate function.
    * @param annotate The function used to annotate a document.
    * @param print The function used to print a document.
+   * @param outputFormat The format used for printing out documents
+   * @param clearPool Whether or not to clear the pool when done
+   *
    * @throws IOException
    */
   protected static void processFiles(String base, final Collection<File> files, int numThreads,
                                      Properties properties, BiConsumer<Annotation, Consumer<Annotation>> annotate,
                                      BiConsumer<Annotation, OutputStream> print,
-                                     OutputFormat outputFormat) throws IOException {
+                                     OutputFormat outputFormat, boolean clearPool) throws IOException {
     // List<Runnable> toRun = new LinkedList<>();
 
     // Process properties here
@@ -1051,6 +1098,7 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
       case CONLLU: defaultExtension = ".conllu"; break;
       case TEXT: defaultExtension = ".out"; break;
       case SERIALIZED: defaultExtension = ".ser.gz"; break;
+      case CUSTOM: defaultExtension = ".out"; break;
       default: throw new IllegalArgumentException("Unknown output format " + outputFormat);
     }
 
@@ -1168,9 +1216,9 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
           timing.done(logger, "Annotating file " + file.getAbsoluteFile());
           Throwable ex = finishedAnnotation.get(CoreAnnotations.ExceptionAnnotation.class);
           if (ex == null) {
+            try{
             //--Output File
-            try {
-              OutputStream fos = new BufferedOutputStream(new FileOutputStream(finalOutputFilename));
+	            OutputStream fos = new BufferedOutputStream(new FileOutputStream(finalOutputFilename));
               print.accept(finishedAnnotation, fos);
               fos.close();
             } catch(IOException e) {
@@ -1182,6 +1230,10 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
               if (totalProcessed.intValue() % 1000 == 0) {
                 logger.info("Processed " + totalProcessed + " documents");
               }
+              // check we've processed or errored on every file, if so tell the pool to clear()
+              if ((totalProcessed.intValue() + totalErrorAnnotating.intValue()) == files.size() && clearPool) {
+                GLOBAL_ANNOTATOR_CACHE.clear();
+              }
             }
           } else if (continueOnAnnotateError) {
             // Error annotating but still wanna continue
@@ -1189,9 +1241,17 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
             logger.err("Error annotating " + file.getAbsoluteFile() + ": " + ex);
             synchronized (totalErrorAnnotating) {
               totalErrorAnnotating.incValue(1);
+              // check we've processed or errored on every file, if so tell the pool to clear()
+              if ((totalProcessed.intValue() + totalErrorAnnotating.intValue()) == files.size() && clearPool) {
+                GLOBAL_ANNOTATOR_CACHE.clear();
+              }
             }
 
           } else {
+            // if stopping due to error, make sure to clear the pool
+            if (clearPool) {
+              GLOBAL_ANNOTATOR_CACHE.clear();
+            }
             throw new RuntimeException("Error annotating " + file.getAbsoluteFile(), ex);
           }
         });
@@ -1218,15 +1278,19 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
     */
   }
 
-  public void processFiles(final Collection<File> files, int numThreads) throws IOException {
-    processFiles(null, files, numThreads);
+  public void processFiles(final Collection<File> files, int numThreads, boolean clearPool) throws IOException {
+    processFiles(null, files, numThreads, clearPool);
   }
 
-  public void processFiles(final Collection<File> files) throws IOException {
-    processFiles(files, 1);
+  public void processFiles(final Collection<File> files, boolean clearPool) throws IOException {
+    processFiles(files, 1, clearPool);
   }
 
   public void run() throws IOException {
+    run(false);
+  }
+
+  public void run(boolean clearPool) throws IOException {
     Timing tim = new Timing();
     StanfordRedwoodConfiguration.minimalSetup();
 
@@ -1253,7 +1317,7 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
         fileName = properties.getProperty("textFile");
       }
       Collection<File> files = new FileSequentialCollection(new File(fileName), properties.getProperty("extension"), true);
-      this.processFiles(null, files, numThreads);
+      this.processFiles(null, files, numThreads, clearPool);
     }
 
     //
@@ -1270,7 +1334,7 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
           files.add(file);
         }
       }
-      this.processFiles(null, files, numThreads);
+      this.processFiles(null, files, numThreads, clearPool);
     }
 
     //
@@ -1323,7 +1387,12 @@ public class StanfordCoreNLP extends AnnotationPipeline  {
       }
     }
     // Run the pipeline
-    new StanfordCoreNLP(props).run();
+    StanfordCoreNLP pipeline = new StanfordCoreNLP(props);
+    pipeline.run(true);
+    // clear the pool if not running in multi-thread mode
+    if (!props.containsKey("threads") || Integer.parseInt(props.getProperty("threads")) <= 1) {
+      pipeline.pool.clear();
+    }
   }
 
 }
